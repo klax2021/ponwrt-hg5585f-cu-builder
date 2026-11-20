@@ -1,0 +1,159 @@
+name: Build PonWrt HG5585F-CU (Auto Upstream Sync)
+
+on:
+  workflow_dispatch:
+    inputs:
+      clean_ccache:
+        description: '清空 Ccache 后全新编译（内核大改时勾选）'
+        type: boolean
+        default: false
+
+  schedule:
+    - cron: '17 15 * * 1'
+
+concurrency:
+  group: ponwrt-cu-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CCACHE_COMPILERCHECK: '%compiler% -dumpmachine; %compiler% -dumpversion'
+  CCACHE_MAXSIZE: 5G
+
+jobs:
+  build:
+    name: Build fiberhome_hg5585f-cu
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout 私有配置仓库
+        uses: actions/checkout@v4
+
+      - name: 清理磁盘释放空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo docker image prune --all --force 2>/dev/null || true
+          sudo apt-get clean
+          df -h
+
+      - name: 安装编译与 BTF (pahole) 依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler dwarves flex gawk \
+            gettext git g++-multilib gcc-multilib gperf help2man intltool \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev lld llvm ninja-build p7zip-full pahole patch pkgconf \
+            python3 python3-docutils python3-pip python3-ply python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs unzip wget xmlto xxd zlib1g-dev zstd
+          pahole --version
+
+      - name: 拉取 wuziwei 最新 master 源码
+        run: |
+          git clone --depth=1 https://github.com/wuziwei/ponwrt-ZN504-HG5585F.git openwrt
+          cd openwrt
+          echo "UPSTREAM_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "UPSTREAM_MSG=$(git log -1 --pretty=%s)" >> $GITHUB_ENV
+
+      - name: 恢复 dl 下载缓存
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: ponwrt-cu-dl-${{ hashFiles('openwrt/feeds.conf.default', 'openwrt/configs/*.config') }}
+          restore-keys: |
+            ponwrt-cu-dl-
+
+      - name: 恢复编译器 Ccache 缓存
+        if: ${{ !inputs.clean_ccache }}
+        uses: actions/cache/restore@v4
+        with:
+          path: openwrt/.ccache
+          key: ponwrt-cu-ccache-${{ env.UPSTREAM_SHA }}
+          restore-keys: |
+            ponwrt-cu-ccache-
+
+      - name: 更新 Feeds 并执行上游定制脚本
+        working-directory: openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          bash ./scripts/customize.sh
+
+      - name: 生成联通版 .config（复刻上游合并流程）
+        working-directory: openwrt
+        run: |
+          ./scripts/kconfig.pl + \
+            configs/an7581.config \
+            configs/release.config > .config
+          sed -i '/^CONFIG_KERNEL_DEBUG_INFO_REDUCED=/d' .config
+          printf 'CONFIG_KERNEL_DEBUG_INFO=y\n# CONFIG_KERNEL_DEBUG_INFO_REDUCED is not set\nCONFIG_KERNEL_DEBUG_INFO_BTF=y\nCONFIG_KERNEL_DEBUG_INFO_BTF_MODULES=y\nCONFIG_KERNEL_MODULE_ALLOW_BTF_MISMATCH=y\nCONFIG_KERNEL_KPROBES=y\nCONFIG_KERNEL_BPF_EVENTS=y\n' >> .config
+          if [ "${{ inputs.clean_ccache }}" != "true" ]; then
+            sed -i '/^CONFIG_DEVEL=/d; /^CONFIG_CCACHE=/d' .config
+            printf 'CONFIG_DEVEL=y\nCONFIG_CCACHE=y\n' >> .config
+          fi
+          make defconfig
+
+      - name: 校验关键配置与 931 补丁
+        working-directory: openwrt
+        run: |
+          echo "=== 机型 ==="
+          grep -E 'CONFIG_TARGET_airoha_an7581_DEVICE_fiberhome_hg5585f-cu' .config
+          echo "=== eBPF / BTF ==="
+          grep -E 'DEBUG_INFO_BTF|BPF_EVENTS|kmod-sched-bpf|kmod-sched-core|kmod-veth|kmod-nf-tproxy' .config
+          echo "=== 931 IPv6 PPE 补丁 ==="
+          find target/linux/airoha -name '*931*ipv6*pppoe*' -print
+
+      - name: 预下载依赖包
+        working-directory: openwrt
+        run: |
+          make download -j"$(nproc)"
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: 开始编译固件
+        working-directory: openwrt
+        run: |
+          [ -x staging_dir/host/bin/ccache ] && CCACHE_DIR=$PWD/.ccache staging_dir/host/bin/ccache -z || true
+          make -j"$(nproc)" || make -j1 V=s
+
+      - name: 保存编译器 Ccache 缓存
+        if: always() && ${{ !inputs.clean_ccache }}
+        uses: actions/cache/save@v4
+        with:
+          path: openwrt/.ccache
+          key: ponwrt-cu-ccache-${{ env.UPSTREAM_SHA }}
+
+      - name: 收集联通版固件产物
+        working-directory: openwrt
+        run: |
+          mkdir -p output
+          find bin/targets/airoha/an7581/ -type f \
+            \( -name '*hg5585f-cu*sysupgrade.itb' -o -name '*hg5585f-cu*recovery.itb' \) \
+            ! -name '*usb-sfp*' -exec cp {} output/ \;
+          cd output
+          for file in $(ls * 2>/dev/null); do
+            [ -f "$file" ] && sha256sum "$file" > "${file}.sha256"
+          done
+          echo "=== 联通版固件产物 ==="
+          ls -lh
+          test -n "$(ls *sysupgrade.itb 2>/dev/null)" || { echo "未找到 CU 固件产物"; exit 1; }
+
+      - name: 发布到私有仓库 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "cu-${{ env.UPSTREAM_SHA }}-${{ github.run_number }}"
+          name: "HG5585F-CU (upstream ${{ env.UPSTREAM_SHA }})"
+          body: |
+            - 上游提交：`${{ env.UPSTREAM_SHA }}` - ${{ env.UPSTREAM_MSG }}
+            - 目标机型：`fiberhome_hg5585f-cu`（烽火 HG5585F 联通版）
+            - 内核底座：eBPF CO-RE + BTF + `kmod-sched-bpf` + `931` IPv6 PPE 修复
+            - sing-box 内核未内置：刷机后将 MiChong 版 `sing-box-linux-arm64-ebpf` 放到 `/usr/bin/sing-box` 并赋可执行权限
+          files: |
+            openwrt/output/*.itb
+            openwrt/output/*.sha256
