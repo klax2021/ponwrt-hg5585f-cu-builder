@@ -1,4 +1,4 @@
-name: Upstream Digest (Telegram)
+name: Upstream Release Digest (Telegram)
 
 on:
   schedule:
@@ -10,88 +10,139 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   digest:
-    name: 推送上游更新日志
+    name: 推送上游 Release 更新说明
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - name: Checkout 私有仓库（读取上次编译 SHA）
+      - name: Checkout 私有仓库（读取上次已推送的 Release）
         uses: actions/checkout@v4
 
-      - name: 读取上次编译时的上游版本
-        id: base
+      - name: 拉取上游 Release 列表并筛选新增
+        id: releases
         run: |
-          if [ -f last-built-sha.txt ]; then
-            SHA=$(tr -d '[:space:]' < last-built-sha.txt)
-            echo "sha=$SHA" >> $GITHUB_OUTPUT
-            echo "上次编译基线: $SHA"
-          else
-            echo "sha=" >> $GITHUB_OUTPUT
-            echo "未找到 last-built-sha.txt，将报告最近提交"
-          fi
+          python3 - <<'PY'
+          import json, os, urllib.request
 
-      - name: 拉取 wuziwei 上游源码
-        run: |
-          git clone --depth=100 https://github.com/wuziwei/ponwrt-ZN504-HG5585F.git upstream
-          cd upstream
-          echo "HEAD_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          API = "https://api.github.com/repos/wuziwei/ponwrt-ZN504-HG5585F/releases?per_page=100"
+          req = urllib.request.Request(API, headers={"User-Agent": "ponwrt-digest", "Accept": "application/vnd.github+json"})
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              releases = json.load(resp)
 
-      - name: 生成增量更新日志
-        id: log
-        run: |
-          cd upstream
-          BASE="${{ steps.base.outputs.sha }}"
-          {
-            echo 'MESSAGE<<EOF'
-            if [ -n "$BASE" ] && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
-              COUNT=$(git rev-list --count "$BASE..HEAD")
-              echo "📦 PonWrt 上游更新（自上次编译 ${BASE} 起，共 ${COUNT} 条提交）"
-              echo ""
-              if [ "$COUNT" -eq 0 ]; then
-                echo "本周上游无新提交，固件无需重编。"
-              else
-                git --no-pager log "$BASE..HEAD" --pretty=format:'• %h %s' --max-count=30
-                if [ "$COUNT" -gt 30 ]; then
-                  echo ""
-                  echo "…另有 $((COUNT-30)) 条提交未列出"
-                fi
-              fi
-            else
-              echo "📦 PonWrt 上游更新（尚无编译基线，展示最近提交）"
-              echo ""
-              git --no-pager log -15 --pretty=format:'• %h %s'
-            fi
-            echo ""
-            echo "上游最新: ${{ env.HEAD_SHA }}"
-            echo "仓库: https://github.com/wuziwei/ponwrt-ZN504-HG5585F"
-            echo "如需重编固件，前往私有仓库 Actions 手动触发 build。"
-            echo 'EOF'
-          } >> $GITHUB_OUTPUT
+          last_file = "last-release-tag.txt"
+          last = ""
+          if os.path.exists(last_file):
+              with open(last_file, encoding="utf-8") as f:
+                  last = f.read().strip()
+          print("已记录的上次 Release:", last or "（无，首次运行）")
 
-      - name: 推送到 Telegram
+          fresh = []
+          for r in releases:
+              if r.get("draft"):
+                  continue
+              if last and r["tag_name"] == last:
+                  break
+              fresh.append(r)
+          if not last:
+              fresh = fresh[:3]  # 首次运行只推最近 3 个，避免刷屏
+              print("首次运行，仅推送最近 3 个 Release")
+
+          with open("fresh_releases.json", "w", encoding="utf-8") as f:
+              json.dump(fresh, f, ensure_ascii=False)
+          print("新增 Release 数量:", len(fresh))
+          for r in fresh:
+              print("  -", r["tag_name"], r.get("published_at"))
+          if releases:
+              with open("latest_tag.txt", "w", encoding="utf-8") as f:
+                  f.write(releases[0]["tag_name"])
+          PY
+
+      - name: 生成 Telegram 友好排版并推送
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MESSAGE: ${{ steps.log.outputs.MESSAGE }}
         run: |
           python3 - <<'PY'
-          import os, json, urllib.request
-          token = os.environ["BOT_TOKEN"]
-          chat = os.environ["CHAT_ID"]
-          text = os.environ["MESSAGE"]
-          payload = json.dumps({
-              "chat_id": chat,
-              "text": text,
-              "disable_web_page_preview": True
-          }).encode("utf-8")
-          url = f"https://api.telegram.org/bot{token}/sendMessage"
-          req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-          with urllib.request.urlopen(req, timeout=30) as resp:
-              result = json.loads(resp.read().decode("utf-8"))
-          if not result.get("ok"):
-              raise SystemExit(f"Telegram 推送失败: {result}")
-          print("Telegram 推送成功")
+          import os, json, re, urllib.request
+
+          CHAT_ID = os.environ["CHAT_ID"]
+          BOT_TOKEN = os.environ["BOT_TOKEN"]
+
+          with open("fresh_releases.json", encoding="utf-8") as f:
+              fresh = json.load(f)
+
+          def clean_md(text):
+              lines = []
+              for raw in (text or "").splitlines():
+                  s = raw.rstrip()
+                  m = re.match(r'^(#{1,6})\s+(.*)$', s)
+                  if m:
+                      level, title = len(m.group(1)), m.group(2)
+                      title = re.sub(r'\*\*|`', '', title)
+                      if level <= 2:
+                          lines.append("【" + title + "】")
+                      else:
+                          lines.append("▸ " + title)
+                      lines.append("")
+                      continue
+                  if not s.strip():
+                      if lines and lines[-1] != "":
+                          lines.append("")
+                      continue
+                  s = re.sub(r'^(\s*)[-*+]\s+', lambda m: '    · ' if len(m.group(1)) >= 2 else '• ', s)
+                  s = s.replace('**', '').replace('`', '')
+                  s = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', s)
+                  lines.append(s)
+              return "\n".join(lines).strip()
+
+          def send(text):
+              payload = json.dumps({
+                  "chat_id": CHAT_ID,
+                  "text": text,
+                  "disable_web_page_preview": True
+              }).encode("utf-8")
+              url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+              req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  result = json.loads(resp.read().decode("utf-8"))
+              if not result.get("ok"):
+                  raise SystemExit(f"Telegram 推送失败: {result}")
+
+          if not fresh:
+              send("📦 PonWrt 上游本周无新 Release，固件无需重编。")
+              print("无新增 Release，已发送提示")
+          else:
+              for r in reversed(fresh):
+                  tag = r.get("tag_name", "")
+                  name = r.get("name", "")
+                  url = r.get("html_url", "")
+                  body = clean_md(r.get("body", ""))
+                  header = f"🆕 上游新版本 {tag}\n{name}\n{'─' * 18}\n"
+                  footer = f"\n{'─' * 18}\n🔗 {url}"
+                  full = header + body + footer
+                  if len(full) > 3900:
+                      full = header + body[:3900 - len(header) - len(footer)] + "…（全文见链接）" + footer
+                  send(full)
+                  print("已推送:", tag)
+
+          with open("latest_tag.txt", encoding="utf-8") as f:
+              latest = f.read().strip()
+          with open("last-release-tag.txt", "w", encoding="utf-8") as f:
+              f.write(latest)
+          print("已记录最新 Release 标记:", latest)
           PY
+
+      - name: 提交已推送标记
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last-release-tag.txt
+          if git diff --cached --quiet; then
+            echo "标记无变化"
+          else
+            git commit -m "chore: update last pushed release tag [skip ci]"
+            git push origin HEAD:master
+          fi
