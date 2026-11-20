@@ -20,7 +20,16 @@
 
 ## 触发构建
 
-- 自动：每周一 23:17（北京时间）检测上游更新并编译
-- 手动：Actions → Build PonWrt HG5585F-CU → Run workflow（内核大改时勾选清空 Ccache）
+- 自动：每周一 23:17（北京时间）检查上游 README 的 Changelog 版本，
+  - 有新版本 → 立即编译 → 编译完成后把「更新日志 + 固件 itb」一起推送到 Telegram，并发布到本仓库 Release
+  - 无新版本 → 只发一条简短提示，不编译
+- 手动：Actions → Weekly Check & Build HG5585F-CU → Run workflow
+  - `force_build` 默认勾选（强制编译，忽略有无更新）；`clean_ccache` 按需勾选
 
-构建约 1.5~2.5 小时，完成后在本仓库 Releases 下载 `*hg5585f-cu*sysupgrade.itb`。
+编译约 1.5~2.5 小时。更新日志来源为上游 README 的「最新版本核心更新动态 (Changelog)」章节，
+日志基线在每次编译成功后自动更新（记录在 `build-base-release.txt`）。
+
+## Telegram 固件附件说明
+
+Telegram Bot 单文件上限 50MB。推送逻辑：固件 ≤48MB 直接发送；超过则先 zip 压缩，
+仍超则自动拆为 45MB 分卷并在 Telegram 给出合并命令（`cat fw.zip.part* > fw.zip && unzip fw.zip`）。

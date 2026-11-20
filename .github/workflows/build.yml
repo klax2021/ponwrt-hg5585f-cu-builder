@@ -1,8 +1,14 @@
-name: Build PonWrt HG5585F-CU (Auto Upstream Sync)
+name: Weekly Check & Build HG5585F-CU
 
 on:
+  schedule:
+    - cron: '17 15 * * 1'
   workflow_dispatch:
     inputs:
+      force_build:
+        description: '强制编译（忽略是否有更新）'
+        type: boolean
+        default: true
       clean_ccache:
         description: '清空 Ccache 后全新编译（内核大改时勾选）'
         type: boolean
@@ -20,8 +26,77 @@ env:
   CCACHE_MAXSIZE: 5G
 
 jobs:
+  check:
+    name: 检查上游 README Changelog 是否有更新
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      has_update: ${{ steps.chk.outputs.has_update }}
+      new_ver: ${{ steps.chk.outputs.new_ver }}
+      changelog: ${{ steps.chk.outputs.changelog }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解析 Changelog 并与编译基线比对
+        id: chk
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/wuziwei/ponwrt-ZN504-HG5585F/master/README.md" -o README.md
+          python3 - <<'PY'
+          import re, os
+          text = open('README.md', encoding='utf-8').read()
+          m = re.search(r'^##\s+.*Changelog.*$', text, re.M | re.I)
+          if not m:
+              print('::error::未找到 Changelog 章节')
+              raise SystemExit(1)
+          sec = text[m.start():]
+          nxt = re.search(r'^##\s+', sec[5:], re.M)
+          if nxt:
+              sec = sec[:nxt.start()+5]
+          vm = re.search(r'v\d{4}\.\d{2}\.\d{2}-\d{4}', sec)
+          new_ver = vm.group() if vm else ''
+          base = ''
+          if os.path.exists('build-base-release.txt'):
+              base = open('build-base-release.txt', encoding='utf-8').read().strip()
+          has = 'true' if new_ver and new_ver != base else 'false'
+          print('最新版本:', new_ver, '| 基线:', base or '(无)', '| 有更新:', has)
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+              f.write(f'new_ver={new_ver}\n')
+              f.write(f'has_update={has}\n')
+              f.write('changelog<<__CLG_END__\n')
+              f.write(sec.strip()+'\n')
+              f.write('__CLG_END__\n')
+          PY
+
+  no_update:
+    name: 无更新提示
+    needs: check
+    if: needs.check.outputs.has_update != 'true' && inputs.force_build != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: 推送无更新提示
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NEW_VER: ${{ needs.check.outputs.new_ver }}
+        run: |
+          python3 - <<'PY'
+          import os, json, urllib.request
+          text = f"📦 PonWrt 本周无新版本（上游当前 {os.environ['NEW_VER'] or '未知'}），固件无需重编。"
+          payload = json.dumps({"chat_id": os.environ["CHAT_ID"], "text": text}).encode("utf-8")
+          url = f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/sendMessage"
+          req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+          with urllib.request.urlopen(req, timeout=30) as r:
+              res = json.loads(r.read().decode("utf-8"))
+          if not res.get("ok"):
+              raise SystemExit(f"推送失败: {res}")
+          print("已推送无更新提示")
+          PY
+
   build:
     name: Build fiberhome_hg5585f-cu
+    needs: check
+    if: needs.check.outputs.has_update == 'true' || inputs.force_build == true
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
@@ -49,21 +124,16 @@ jobs:
             libtool libyaml-dev lld llvm ninja-build p7zip-full pahole patch pkgconf \
             python3 python3-docutils python3-pip python3-ply python3-pyelftools \
             qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
-            uglifyjs unzip wget xmlto xxd zlib1g-dev zstd
+            uglifyjs unzip wget xmlto xxd zlib1g-dev zstd zip
           pahole --version
 
       - name: 拉取 wuziwei 最新 master 源码
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git clone --depth=1 https://github.com/wuziwei/ponwrt-ZN504-HG5585F.git openwrt
           cd openwrt
           echo "UPSTREAM_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
           echo "UPSTREAM_MSG=$(git log -1 --pretty=%s)" >> $GITHUB_ENV
           echo "BUILD_TIME=$(date -u +'%Y-%m-%d %H:%M UTC')" >> $GITHUB_ENV
-          LATEST_TAG=$(curl -s "https://api.github.com/repos/wuziwei/ponwrt-ZN504-HG5585F/releases/latest" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null || echo "")
-          echo "BASE_RELEASE_TAG=${LATEST_TAG}" >> $GITHUB_ENV
-          echo "编译时上游最新 Release: ${LATEST_TAG}"
 
       - name: 恢复 dl 下载缓存
         uses: actions/cache@v4
@@ -137,7 +207,7 @@ jobs:
         run: |
           mkdir -p output
           find bin/targets/airoha/an7581/ -type f \
-            \( -name '*hg5585f-cu*sysupgrade.itb' -o -name '*hg5585f-cu*recovery.itb' \) \
+            -name '*hg5585f-cu*squashfs-sysupgrade.itb' \
             ! -name '*usb-sfp*' -exec cp {} output/ \;
           cd output
           for file in $(ls * 2>/dev/null); do
@@ -145,14 +215,23 @@ jobs:
           done
           echo "=== 联通版固件产物 ==="
           ls -lh
-          test -n "$(ls *sysupgrade.itb 2>/dev/null)" || { echo "未找到 CU 固件产物"; exit 1; }
+          test -n "$(ls *squashfs-sysupgrade.itb 2>/dev/null)" || { echo "未找到 CU 固件产物"; exit 1; }
+          echo "FW_PATH=$PWD/$(ls *squashfs-sysupgrade.itb | head -1)" >> $GITHUB_ENV
+
+      - name: 上传固件为 Artifact（供推送 job 使用）
+        uses: actions/upload-artifact@v4
+        with:
+          name: cu-firmware
+          path: openwrt/output/*
+          retention-days: 7
 
       - name: 发布到私有仓库 Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "cu-${{ env.UPSTREAM_SHA }}-${{ github.run_number }}"
-          name: "HG5585F-CU (upstream ${{ env.UPSTREAM_SHA }})"
+          tag_name: "cu-${{ needs.check.outputs.new_ver }}-${{ github.run_number }}"
+          name: "HG5585F-CU (${{ needs.check.outputs.new_ver }})"
           body: |
+            - 上游版本：`${{ needs.check.outputs.new_ver }}`
             - 上游提交：`${{ env.UPSTREAM_SHA }}` - ${{ env.UPSTREAM_MSG }}
             - 目标机型：`fiberhome_hg5585f-cu`（烽火 HG5585F 联通版）
             - 内核底座：eBPF CO-RE + BTF + `kmod-sched-bpf` + `931` IPv6 PPE 修复
@@ -161,14 +240,128 @@ jobs:
             openwrt/output/*.itb
             openwrt/output/*.sha256
 
-      - name: 记录本次编译基线（供更新日志比对）
+      - name: 记录本次编译基线
         run: |
+          echo "${{ needs.check.outputs.new_ver }}" > build-base-release.txt
           echo "${{ env.UPSTREAM_SHA }}" > last-built-sha.txt
           echo "${{ env.UPSTREAM_MSG }}" > last-built-msg.txt
-          echo "${{ env.BASE_RELEASE_TAG }}" > build-base-release.txt
           echo "${{ env.BUILD_TIME }}" > build-time.txt
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add last-built-sha.txt last-built-msg.txt build-base-release.txt build-time.txt
-          git commit -m "chore: record build baseline ${{ env.BASE_RELEASE_TAG }} @ ${{ env.UPSTREAM_SHA }} [skip ci]" || echo "no changes to commit"
+          git add build-base-release.txt last-built-sha.txt last-built-msg.txt build-time.txt
+          git commit -m "chore: build baseline ${{ needs.check.outputs.new_ver }} @ ${{ env.UPSTREAM_SHA }} [skip ci]" || echo "no changes"
           git push origin HEAD:master
+
+  notify:
+    name: 推送固件与更新日志到 Telegram
+    needs: [check, build]
+    if: needs.check.outputs.has_update == 'true' || inputs.force_build == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: 下载固件 Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cu-firmware
+          path: firmware
+
+      - name: 推送更新日志 + 固件附件
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NEW_VER: ${{ needs.check.outputs.new_ver }}
+          CHANGELOG: ${{ needs.check.outputs.changelog }}
+        run: |
+          python3 - <<'PY'
+          import os, re, json, glob, subprocess, urllib.request
+
+          CHAT_ID = os.environ["CHAT_ID"]
+          TOKEN = os.environ["BOT_TOKEN"]
+          NEW_VER = os.environ.get("NEW_VER", "")
+          API = f"https://api.telegram.org/bot{TOKEN}"
+          MAX = 48 * 1024 * 1024  # 留 2MB 安全余量（官方上限 50MB）
+
+          def api(method, payload):
+              req = urllib.request.Request(API + "/" + method,
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={"Content-Type": "application/json"})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  res = json.loads(r.read().decode("utf-8"))
+              if not res.get("ok"):
+                  raise SystemExit(f"{method} 失败: {res}")
+              return res
+
+          def send_text(text):
+              api("sendMessage", {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True})
+
+          def send_doc(path, caption=""):
+              boundary = "----ponwrt" + os.urandom(8).hex()
+              body = b""
+              for k, v in (("chat_id", CHAT_ID), ("caption", caption)):
+                  body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n").encode("utf-8")
+              name = os.path.basename(path)
+              body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n").encode("utf-8")
+              with open(path, "rb") as f:
+                  body += f.read()
+              body += f"\r\n--{boundary}--\r\n".encode("utf-8")
+              req = urllib.request.Request(API + "/sendDocument", data=body,
+                  headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+              with urllib.request.urlopen(req, timeout=300) as r:
+                  res = json.loads(r.read().decode("utf-8"))
+              if not res.get("ok"):
+                  raise SystemExit(f"sendDocument 失败: {res}")
+
+          def clean_md(text):
+              out = []
+              for raw in (text or "").splitlines():
+                  s = raw.rstrip()
+                  if not s.strip() or re.fullmatch(r'[\s*_\-]+', s):
+                      continue
+                  if re.fullmatch(r'\[\]\([^)]+\)', s):
+                      continue
+                  m = re.match(r'^(#{1,6})\s+(.*)$', s)
+                  if m:
+                      t = re.sub(r'\*\*|`', '', m.group(2))
+                      out.append("【" + t + "】" if len(m.group(1)) <= 3 else "▸ " + t)
+                      out.append("")
+                      continue
+                  s = re.sub(r'^(\s*)[-*+]\s+', lambda m: '    · ' if len(m.group(1)) >= 2 else '• ', s)
+                  s = re.sub(r'^(\s*)(\d+)\.\s+', lambda m: m.group(1) + m.group(2) + '. ', s)
+                  s = s.replace('**', '').replace('`', '')
+                  s = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', s)
+                  out.append(s)
+              return "\n".join(out).strip()
+
+          log = clean_md(os.environ.get("CHANGELOG", ""))
+          header = f"🆕 上游更新 {NEW_VER}\n（自上次编译以来的变化，来源：上游 README Changelog）\n{'─' * 18}\n"
+          log_text = header + log
+          if len(log_text) > 3900:
+              log_text = log_text[:3900] + "\n…（全文见上游 README）"
+          send_text(log_text)
+          print("更新日志已推送")
+
+          fw = sorted(glob.glob("firmware/*squashfs-sysupgrade.itb"))
+          if not fw:
+              raise SystemExit("未找到固件 itb")
+          path = fw[0]
+          size = os.path.getsize(path)
+          print("固件大小:", size, "bytes")
+
+          if size <= MAX:
+              send_doc(path, f"HG5585F-CU 联通版固件 {NEW_VER}（{size//1024//1024}MB）")
+              print("固件直发成功")
+          else:
+              subprocess.run(["zip", "-9", "-j", "fw.zip", path], check=True)
+              zsize = os.path.getsize("fw.zip")
+              print("zip 压缩后:", zsize, "bytes")
+              if zsize <= MAX:
+                  send_doc("fw.zip", f"HG5585F-CU 固件 {NEW_VER}（zip 压缩 {zsize//1024//1024}MB）\n解压得 squashfs-sysupgrade.itb")
+                  print("固件 zip 发送成功")
+              else:
+                  subprocess.run(["split", "-b", "45m", "-d", "-a", "2", "fw.zip", "fw.zip.part"], check=True)
+                  parts = sorted(glob.glob("fw.zip.part*"))
+                  send_text(f"📦 固件 {NEW_VER} 超过 Telegram 单文件 50MB 上限，已拆为 {len(parts)} 个分卷，随后逐个发送。\n合并命令：cat fw.zip.part* > fw.zip && unzip fw.zip")
+                  for i, p in enumerate(parts, 1):
+                      send_doc(p, f"分卷 {i}/{len(parts)} - {NEW_VER}")
+                  print("固件分卷发送完成，共", len(parts), "卷")
+          PY
