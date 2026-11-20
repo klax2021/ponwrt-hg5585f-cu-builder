@@ -223,22 +223,7 @@ jobs:
         with:
           name: cu-firmware
           path: openwrt/output/*
-          retention-days: 7
-
-      - name: 发布到私有仓库 Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: "cu-${{ needs.check.outputs.new_ver }}-${{ github.run_number }}"
-          name: "HG5585F-CU (${{ needs.check.outputs.new_ver }})"
-          body: |
-            - 上游版本：`${{ needs.check.outputs.new_ver }}`
-            - 上游提交：`${{ env.UPSTREAM_SHA }}` - ${{ env.UPSTREAM_MSG }}
-            - 目标机型：`fiberhome_hg5585f-cu`（烽火 HG5585F 联通版）
-            - 内核底座：eBPF CO-RE + BTF + `kmod-sched-bpf` + `931` IPv6 PPE 修复
-            - sing-box 内核未内置：刷机后将 MiChong 版 `sing-box-linux-arm64-ebpf` 放到 `/usr/bin/sing-box` 并赋可执行权限
-          files: |
-            openwrt/output/*.itb
-            openwrt/output/*.sha256
+          retention-days: 90
 
       - name: 记录本次编译基线
         run: |

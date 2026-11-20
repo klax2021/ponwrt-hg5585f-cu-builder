@@ -2,7 +2,8 @@
 
 私有仓库。只存放本构建工作流，不 Fork 上游。每次触发时动态拉取
 [wuziwei/ponwrt-ZN504-HG5585F](https://github.com/wuziwei/ponwrt-ZN504-HG5585F) 最新 master，
-完全复刻上游编译流程，仅收集 `fiberhome_hg5585f-cu`（烽火 HG5585F 联通版）产物并发布到本仓库 Release。
+完全复刻上游编译流程，仅收集 `fiberhome_hg5585f-cu`（烽火 HG5585F 联通版）产物。
+**不发布 Release**：产物仅上传本仓库 Actions Artifact（保留 90 天）并推送到 Telegram。
 
 ## 固件内容
 
@@ -21,7 +22,7 @@
 ## 触发构建
 
 - 自动：每周一 23:17（北京时间）检查上游 README 的 Changelog 版本，
-  - 有新版本 → 立即编译 → 编译完成后把「更新日志 + 固件 itb」一起推送到 Telegram，并发布到本仓库 Release
+  - 有新版本 → 立即编译 → 编译完成后把「更新日志 + 固件 itb」一起推送到 Telegram，并上传 Actions Artifact
   - 无新版本 → 只发一条简短提示，不编译
 - 手动：Actions → Weekly Check & Build HG5585F-CU → Run workflow
   - `force_build` 默认勾选（强制编译，忽略有无更新）；`clean_ccache` 按需勾选
