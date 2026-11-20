@@ -108,7 +108,8 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
           sudo docker image prune --all --force 2>/dev/null || true
           sudo apt-get clean
-          df -h
+          echo "=== [磁盘] 清理后 ==="
+          df -h /
 
       - name: 安装编译与 BTF (pahole) 依赖
         env:
@@ -159,41 +160,108 @@ jobs:
           ./scripts/feeds install -a
           bash ./scripts/customize.sh
 
-      - name: 生成联通版 .config（复刻上游合并流程）
+      - name: 生成 CU 单机型 .config（收敛设备 + 剥离应用 + 保留 BTF）
         working-directory: openwrt
         run: |
           ./scripts/kconfig.pl + \
             configs/an7581.config \
             configs/release.config > .config
-          sed -i '/^CONFIG_KERNEL_DEBUG_INFO_REDUCED=/d' .config
-          printf 'CONFIG_KERNEL_DEBUG_INFO=y\n# CONFIG_KERNEL_DEBUG_INFO_REDUCED is not set\nCONFIG_KERNEL_DEBUG_INFO_BTF=y\nCONFIG_KERNEL_DEBUG_INFO_BTF_MODULES=y\nCONFIG_KERNEL_MODULE_ALLOW_BTF_MISMATCH=y\nCONFIG_KERNEL_KPROBES=y\nCONFIG_KERNEL_BPF_EVENTS=y\n' >> .config
+
+          # 1) 剥离 Honk / Tailscale 及其专属 LuCI / i18n / 依赖（用户态应用改为后装，避免 Rust/Go 工具链入编译链）
+          for p in honk luci-app-honk luci-lib-daeuniverse luci-i18n-daeuniverse-zh-cn \
+                   tailscale luci-app-tailscale-community luci-i18n-tailscale-community-zh-cn \
+                   v2ray-geoip v2ray-geosite; do
+            sed -i "s/^CONFIG_PACKAGE_${p}=y/# CONFIG_PACKAGE_${p} is not set/" .config
+          done
+
+          # 2) 收敛设备：只保留 HG5585F-CU，关闭其余所有 TARGET_DEVICE（含 usb-sfp 变体）
+          for dev in $(grep -oP '^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_\K[A-Za-z0-9_.-]+(?==y)' .config); do
+            case "$dev" in
+              fiberhome_hg5585f-cu) ;;
+              *) sed -i "s/^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_${dev}=y/# CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_${dev} is not set/" .config ;;
+            esac
+          done
+
+          # 3) 关闭 Nokia 专用 U-Boot 变体（CU 不需要）
+          sed -i 's/^CONFIG_PACKAGE_u-boot-an7581_nokia_xg-040g-md=y/# CONFIG_PACKAGE_u-boot-an7581_nokia_xg-040g-md is not set/' .config
+
+          # 4) BTF/eBPF：先移除所有相关旧行，再统一显式写入（避免 sed 删行后落到 Kconfig 默认值）
+          sed -i '/^CONFIG_KERNEL_DEBUG_INFO/d; /^# CONFIG_KERNEL_DEBUG_INFO/d' .config
+          cat >> .config <<'EOF'
+          CONFIG_KERNEL_DEBUG_INFO=y
+          # CONFIG_KERNEL_DEBUG_INFO_REDUCED is not set
+          CONFIG_KERNEL_DEBUG_INFO_BTF=y
+          CONFIG_KERNEL_DEBUG_INFO_BTF_MODULES=y
+          CONFIG_KERNEL_MODULE_ALLOW_BTF_MISMATCH=y
+          CONFIG_KERNEL_KPROBES=y
+          CONFIG_KERNEL_BPF_EVENTS=y
+          EOF
+
+          # 5) Ccache（clean_ccache=true 时完全关闭）
           if [ "${{ inputs.clean_ccache }}" != "true" ]; then
             sed -i '/^CONFIG_DEVEL=/d; /^CONFIG_CCACHE=/d' .config
             printf 'CONFIG_DEVEL=y\nCONFIG_CCACHE=y\n' >> .config
           fi
+
           make defconfig
 
-      - name: 校验关键配置与 931 补丁
+      - name: 硬校验（不合格立即中止，不带错编译）
         working-directory: openwrt
         run: |
-          echo "=== 机型 ==="
-          grep -E 'CONFIG_TARGET_airoha_an7581_DEVICE_fiberhome_hg5585f-cu' .config
-          echo "=== eBPF / BTF ==="
-          grep -E 'DEBUG_INFO_BTF|BPF_EVENTS|kmod-sched-bpf|kmod-sched-core|kmod-veth|kmod-nf-tproxy' .config
+          set -e
+          fail=0
+          chk() { if eval "$1"; then echo "  OK   $2"; else echo "  FAIL $2"; fail=1; fi; }
+
+          echo "=== defconfig 后实际选中的设备 ==="
+          grep '^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_.*=y' .config || true
+          echo "=== 机型 / eBPF / BTF ==="
+          grep -E 'DEBUG_INFO_BTF|BPF_EVENTS|DEBUG_INFO_REDUCED|DEBUG_INFO=' .config || true
           echo "=== 931 IPv6 PPE 补丁 ==="
           find target/linux/airoha -name '*931*ipv6*pppoe*' -print
+
+          echo "=== 校验闸门 ==="
+          # 1) CU 必须选中
+          chk "grep -q '^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_fiberhome_hg5585f-cu=y' .config" "CU 设备已选中"
+          # 2) 只能有 CU 一个设备（防止 defconfig 把其它设备选回来）
+          dev_count=$(grep -c '^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_.*=y' .config || true)
+          chk "[ "$dev_count" -eq 1 ]" "仅 CU 单机型（当前 $dev_count 个设备）"
+          # 3) 精简调试信息必须关闭（BTF 的硬性前提）
+          chk "grep -q '^# CONFIG_KERNEL_DEBUG_INFO_REDUCED is not set' .config" "精简调试信息已关闭"
+          # 4) BTF / BPF 三件套齐全
+          chk "grep -q '^CONFIG_KERNEL_DEBUG_INFO_BTF=y' .config" "BTF 已启用"
+          chk "grep -q '^CONFIG_KERNEL_BPF_EVENTS=y' .config" "BPF_EVENTS 已启用"
+          # 5) Honk / Tailscale 必须未选中
+          chk "! grep -qE '^CONFIG_PACKAGE_(honk|tailscale|luci-app-honk|luci-app-tailscale-community)=y' .config" "Honk/Tailscale 已剥离"
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::配置硬校验未通过，中止编译（详见上方 FAIL 项）"
+            exit 1
+          fi
+          echo "全部校验通过，开始下载与编译"
 
       - name: 预下载依赖包
         working-directory: openwrt
         run: |
+          echo "=== [磁盘] 下载前 ==="
+          df -h /
           make download -j"$(nproc)"
           find dl -size -1024c -exec rm -f {} \;
+          echo "=== [磁盘] 下载后 ==="
+          df -h /
 
       - name: 开始编译固件
         working-directory: openwrt
         run: |
-          [ -x staging_dir/host/bin/ccache ] && CCACHE_DIR=$PWD/.ccache staging_dir/host/bin/ccache -z || true
-          make -j"$(nproc)" || make -j1 V=s
+          export CCACHE_DIR="$PWD/.ccache"
+          echo "=== [磁盘] 编译前 ==="
+          df -h /
+          mkdir -p "$CCACHE_DIR"
+          [ -x staging_dir/host/bin/ccache ] && staging_dir/host/bin/ccache -z || true
+          # 单次编译：失败直接退出，不在磁盘耗尽时空转重编（满盘重试只会雪上加霜）
+          make -j"$(nproc)"
+          echo "=== [磁盘] 编译后 ==="
+          df -h /
+          [ -x staging_dir/host/bin/ccache ] && staging_dir/host/bin/ccache -s || true
 
       - name: 保存编译器 Ccache 缓存
         if: always() && ${{ !inputs.clean_ccache }}
