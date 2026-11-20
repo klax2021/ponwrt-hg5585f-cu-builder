@@ -1,0 +1,97 @@
+name: Upstream Digest (Telegram)
+
+on:
+  schedule:
+    - cron: '17 15 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-digest
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  digest:
+    name: 推送上游更新日志
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout 私有仓库（读取上次编译 SHA）
+        uses: actions/checkout@v4
+
+      - name: 读取上次编译时的上游版本
+        id: base
+        run: |
+          if [ -f last-built-sha.txt ]; then
+            SHA=$(tr -d '[:space:]' < last-built-sha.txt)
+            echo "sha=$SHA" >> $GITHUB_OUTPUT
+            echo "上次编译基线: $SHA"
+          else
+            echo "sha=" >> $GITHUB_OUTPUT
+            echo "未找到 last-built-sha.txt，将报告最近提交"
+          fi
+
+      - name: 拉取 wuziwei 上游源码
+        run: |
+          git clone --depth=100 https://github.com/wuziwei/ponwrt-ZN504-HG5585F.git upstream
+          cd upstream
+          echo "HEAD_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: 生成增量更新日志
+        id: log
+        run: |
+          cd upstream
+          BASE="${{ steps.base.outputs.sha }}"
+          {
+            echo 'MESSAGE<<EOF'
+            if [ -n "$BASE" ] && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+              COUNT=$(git rev-list --count "$BASE..HEAD")
+              echo "📦 PonWrt 上游更新（自上次编译 ${BASE} 起，共 ${COUNT} 条提交）"
+              echo ""
+              if [ "$COUNT" -eq 0 ]; then
+                echo "本周上游无新提交，固件无需重编。"
+              else
+                git --no-pager log "$BASE..HEAD" --pretty=format:'• %h %s' --max-count=30
+                if [ "$COUNT" -gt 30 ]; then
+                  echo ""
+                  echo "…另有 $((COUNT-30)) 条提交未列出"
+                fi
+              fi
+            else
+              echo "📦 PonWrt 上游更新（尚无编译基线，展示最近提交）"
+              echo ""
+              git --no-pager log -15 --pretty=format:'• %h %s'
+            fi
+            echo ""
+            echo "上游最新: ${{ env.HEAD_SHA }}"
+            echo "仓库: https://github.com/wuziwei/ponwrt-ZN504-HG5585F"
+            echo "如需重编固件，前往私有仓库 Actions 手动触发 build。"
+            echo 'EOF'
+          } >> $GITHUB_OUTPUT
+
+      - name: 推送到 Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MESSAGE: ${{ steps.log.outputs.MESSAGE }}
+        run: |
+          python3 - <<'PY'
+          import os, json, urllib.request
+          token = os.environ["BOT_TOKEN"]
+          chat = os.environ["CHAT_ID"]
+          text = os.environ["MESSAGE"]
+          payload = json.dumps({
+              "chat_id": chat,
+              "text": text,
+              "disable_web_page_preview": True
+          }).encode("utf-8")
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
+          req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              result = json.loads(resp.read().decode("utf-8"))
+          if not result.get("ok"):
+              raise SystemExit(f"Telegram 推送失败: {result}")
+          print("Telegram 推送成功")
+          PY

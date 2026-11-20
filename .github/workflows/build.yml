@@ -8,9 +8,6 @@ on:
         type: boolean
         default: false
 
-  schedule:
-    - cron: '17 15 * * 1'
-
 concurrency:
   group: ponwrt-cu-build
   cancel-in-progress: false
@@ -157,3 +154,13 @@ jobs:
           files: |
             openwrt/output/*.itb
             openwrt/output/*.sha256
+
+      - name: 记录本次编译的上游版本（供更新日志比对）
+        run: |
+          echo "${{ env.UPSTREAM_SHA }}" > last-built-sha.txt
+          echo "${{ env.UPSTREAM_MSG }}" > last-built-msg.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last-built-sha.txt last-built-msg.txt
+          git commit -m "chore: record built upstream ${{ env.UPSTREAM_SHA }} [skip ci]" || echo "no changes to commit"
+          git push origin HEAD:master
