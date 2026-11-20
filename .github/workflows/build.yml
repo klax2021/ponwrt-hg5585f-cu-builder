@@ -223,7 +223,7 @@ jobs:
         with:
           name: cu-firmware
           path: openwrt/output/*
-          retention-days: 90
+          retention-days: 7
 
       - name: 记录本次编译基线
         run: |
