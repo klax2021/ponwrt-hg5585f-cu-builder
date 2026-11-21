@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       force_build:
-        description: '强制编译（忽略是否有更新）'
+        description: '编译固件（不勾选则仅同步更新日志，不编译）'
         type: boolean
-        default: true
+        default: false
 
 concurrency:
   group: ponwrt-cu-build
@@ -85,10 +85,79 @@ jobs:
           print("已推送无更新提示")
           PY
 
+  notify_update:
+    name: 定期同步上游更新日志（不编译）
+    needs: check
+    if: needs.check.outputs.has_update == 'true' && inputs.force_build != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 推送更新日志摘要
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NEW_VER: ${{ needs.check.outputs.new_ver }}
+          CHANGELOG: ${{ needs.check.outputs.changelog }}
+        run: |
+          python3 - <<'PY'
+          import os, re, json, urllib.request
+
+          def clean_md(text):
+              out = []
+              for line0 in (text or "").splitlines():
+                  line = line0.rstrip()
+                  if not line.strip() or re.fullmatch(r'[\s*_\-]+', line):
+                      continue
+                  m = re.match(r'^(#{1,6})\s+(.*)$', line)
+                  if m:
+                      t = re.sub(r'\*\*|`', '', m.group(2))
+                      out.append("【" + t + "】" if len(m.group(1)) <= 3 else "▸ " + t)
+                      out.append("")
+                      continue
+                  line = re.sub(r'^(\s*)[-*+]\s+', lambda m: '    · ' if len(m.group(1)) >= 2 else '• ', line)
+                  line = re.sub(r'^(\s*)(\d+)\.\s+', lambda m: m.group(1) + m.group(2) + '. ', line)
+                  line = line.replace('**', '').replace('`', '')
+                  line = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', line)
+                  out.append(line)
+              return "\n".join(out).strip()
+
+          ver = os.environ.get("NEW_VER", "")
+          log = clean_md(os.environ.get("CHANGELOG", ""))
+          header = f"📢 PonWrt 上游新版本 {ver}\n（自上个版本以来的重要变化）\n{'─' * 18}\n"
+          text = header + log
+          if len(text) > 3800:
+              text = text[:3800] + "\n…（全文见上游 README）"
+          text += "\n\nℹ️ 本仓库已暂停自动编译；如需升级，请在 Actions 手动触发并勾选「编译固件」。"
+          payload = json.dumps({
+              "chat_id": os.environ["CHAT_ID"],
+              "text": text,
+              "disable_web_page_preview": True,
+          }).encode("utf-8")
+          req = urllib.request.Request(
+              "https://api.telegram.org/bot" + os.environ["BOT_TOKEN"] + "/sendMessage",
+              data=payload, headers={"Content-Type": "application/json"})
+          with urllib.request.urlopen(req, timeout=30) as r:
+              res = json.loads(r.read().decode("utf-8"))
+          if not res.get("ok"):
+              raise SystemExit("推送失败: " + str(res))
+          print("更新日志已推送")
+          PY
+
+      - name: 更新已同步基线（避免每周重复推送同一版本）
+        run: |
+          echo "${{ needs.check.outputs.new_ver }}" > build-base-release.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add build-base-release.txt
+          git commit -m "chore: sync changelog baseline ${{ needs.check.outputs.new_ver }} [skip ci]" || echo "no changes"
+          git push origin HEAD:master
+
   build:
     name: Build fiberhome_hg5585f-cu
     needs: check
-    if: needs.check.outputs.has_update == 'true' || inputs.force_build == true
+    if: inputs.force_build == true
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
@@ -297,7 +366,7 @@ jobs:
   notify:
     name: 推送固件与更新日志到 Telegram
     needs: [check, build]
-    if: needs.check.outputs.has_update == 'true' || inputs.force_build == true
+    if: inputs.force_build == true
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
