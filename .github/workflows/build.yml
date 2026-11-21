@@ -9,10 +9,6 @@ on:
         description: '强制编译（忽略是否有更新）'
         type: boolean
         default: true
-      clean_ccache:
-        description: '清空 Ccache 后全新编译（内核大改时勾选）'
-        type: boolean
-        default: false
 
 concurrency:
   group: ponwrt-cu-build
@@ -20,10 +16,6 @@ concurrency:
 
 permissions:
   contents: write
-
-env:
-  CCACHE_COMPILERCHECK: '%compiler% -dumpmachine; %compiler% -dumpversion'
-  CCACHE_MAXSIZE: 5G
 
 jobs:
   check:
@@ -103,11 +95,19 @@ jobs:
       - name: Checkout 私有配置仓库
         uses: actions/checkout@v4
 
-      - name: 清理磁盘释放空间
+      - name: 深度清理磁盘（free-disk-space）
+        uses: jlumbroso/free-disk-space@main
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+          preinstalled-runtimes: true
+
+      - name: 确认磁盘清理结果
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
-          sudo docker image prune --all --force 2>/dev/null || true
-          sudo apt-get clean
           echo "=== [磁盘] 清理后 ==="
           df -h /
 
@@ -118,7 +118,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             asciidoc autoconf automake autopoint binutils bison build-essential \
-            bzip2 ccache clang cmake cpio curl device-tree-compiler dwarves flex gawk \
+            bzip2 clang cmake cpio curl device-tree-compiler dwarves flex gawk \
             gettext git g++-multilib gcc-multilib gperf help2man intltool \
             libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
             libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
@@ -143,15 +143,6 @@ jobs:
           key: ponwrt-cu-dl-${{ hashFiles('openwrt/feeds.conf.default', 'openwrt/configs/*.config') }}
           restore-keys: |
             ponwrt-cu-dl-
-
-      - name: 恢复编译器 Ccache 缓存
-        if: ${{ !inputs.clean_ccache }}
-        uses: actions/cache/restore@v4
-        with:
-          path: openwrt/.ccache
-          key: ponwrt-cu-ccache-${{ env.UPSTREAM_SHA }}
-          restore-keys: |
-            ponwrt-cu-ccache-
 
       - name: 更新 Feeds 并执行上游定制脚本
         working-directory: openwrt
@@ -197,11 +188,13 @@ jobs:
           CONFIG_KERNEL_BPF_EVENTS=y
           EOF
 
-          # 5) Ccache（clean_ccache=true 时完全关闭）
-          if [ "${{ inputs.clean_ccache }}" != "true" ]; then
-            sed -i '/^CONFIG_DEVEL=/d; /^CONFIG_CCACHE=/d' .config
-            printf 'CONFIG_DEVEL=y\nCONFIG_CCACHE=y\n' >> .config
-          fi
+          # 5) AUTOREMOVE：编完一个包即删其 build_dir 临时目录，压低峰值磁盘占用
+          sed -i '/^CONFIG_AUTOREMOVE=/d' .config
+          printf 'CONFIG_AUTOREMOVE=y\n' >> .config
+
+          # 6) 彻底关闭 Ccache（只省时间不省盘，反额外占 5G 峰值空间）
+          sed -i '/^CONFIG_DEVEL=/d; /^CONFIG_CCACHE=/d' .config
+          printf 'CONFIG_DEVEL=y\n# CONFIG_CCACHE is not set\n' >> .config
 
           make defconfig
 
@@ -230,7 +223,9 @@ jobs:
           # 4) BTF / BPF 三件套齐全
           chk "grep -q '^CONFIG_KERNEL_DEBUG_INFO_BTF=y' .config" "BTF 已启用"
           chk "grep -q '^CONFIG_KERNEL_BPF_EVENTS=y' .config" "BPF_EVENTS 已启用"
-          # 5) Honk / Tailscale 必须未选中
+          # 5) AUTOREMOVE 必须启用
+          chk "grep -q '^CONFIG_AUTOREMOVE=y' .config" "AUTOREMOVE 已启用"
+          # 6) Honk / Tailscale 必须未选中
           chk "! grep -qE '^CONFIG_PACKAGE_(honk|tailscale|luci-app-honk|luci-app-tailscale-community)=y' .config" "Honk/Tailscale 已剥离"
 
           if [ "$fail" -ne 0 ]; then
@@ -252,23 +247,17 @@ jobs:
       - name: 开始编译固件
         working-directory: openwrt
         run: |
-          export CCACHE_DIR="$PWD/.ccache"
           echo "=== [磁盘] 编译前 ==="
           df -h /
-          mkdir -p "$CCACHE_DIR"
-          [ -x staging_dir/host/bin/ccache ] && staging_dir/host/bin/ccache -z || true
-          # 单次编译：失败直接退出，不在磁盘耗尽时空转重编（满盘重试只会雪上加霜）
-          make -j"$(nproc)"
+          # 单次编译：失败立即退出并打印磁盘现场，不空转重编烧额度
+          make -j"$(nproc)" || {
+            echo "=== 编译失败，磁盘现场 ==="
+            df -h /
+            du -sh build_dir staging_dir 2>/dev/null || true
+            exit 1
+          }
           echo "=== [磁盘] 编译后 ==="
           df -h /
-          [ -x staging_dir/host/bin/ccache ] && staging_dir/host/bin/ccache -s || true
-
-      - name: 保存编译器 Ccache 缓存
-        if: always() && ${{ !inputs.clean_ccache }}
-        uses: actions/cache/save@v4
-        with:
-          path: openwrt/.ccache
-          key: ponwrt-cu-ccache-${{ env.UPSTREAM_SHA }}
 
       - name: 收集联通版固件产物
         working-directory: openwrt
